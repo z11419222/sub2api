@@ -109,10 +109,11 @@ func (e *plainEncryptor) Decrypt(ciphertext string) (string, error) {
 }
 
 type mockDumper struct {
-	dumpData []byte
-	dumpErr  error
-	restored []byte
-	restErr  error
+	dumpData    []byte
+	dumpErr     error
+	restored    []byte
+	restErr     error
+	restoreHook func() error
 }
 
 func (m *mockDumper) Dump(_ context.Context) (io.ReadCloser, error) {
@@ -131,6 +132,9 @@ func (m *mockDumper) Restore(_ context.Context, data io.Reader) error {
 		return err
 	}
 	m.restored = d
+	if m.restoreHook != nil {
+		return m.restoreHook()
+	}
 	return nil
 }
 
@@ -159,8 +163,9 @@ func (d *blockingDumper) Restore(_ context.Context, data io.Reader) error {
 }
 
 type mockObjectStore struct {
-	objects map[string][]byte
-	mu      sync.Mutex
+	objects       map[string][]byte
+	listedObjects []BackupObjectInfo
+	mu            sync.Mutex
 }
 
 func newMockObjectStore() *mockObjectStore {
@@ -201,6 +206,24 @@ func (m *mockObjectStore) PresignURL(_ context.Context, key string, _ time.Durat
 
 func (m *mockObjectStore) HeadBucket(_ context.Context) error {
 	return nil
+}
+
+func (m *mockObjectStore) List(_ context.Context, prefix string) ([]BackupObjectInfo, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	var result []BackupObjectInfo
+	for _, obj := range m.listedObjects {
+		if strings.HasPrefix(obj.Key, prefix) {
+			result = append(result, obj)
+		}
+	}
+	for key, data := range m.objects {
+		if strings.HasPrefix(key, prefix) {
+			result = append(result, BackupObjectInfo{Key: key, SizeBytes: int64(len(data))})
+		}
+	}
+	return result, nil
 }
 
 func newTestBackupService(repo *mockSettingRepo, dumper DBDumper, store *mockObjectStore) *BackupService {
@@ -497,6 +520,207 @@ func TestBackupService_ListBackups_Sorted(t *testing.T) {
 	require.Equal(t, "rec-0", records[2].ID)
 }
 
+func TestBackupService_DiscoverRemoteBackups_ImportsMissingRemoteBackups(t *testing.T) {
+	repo := newMockSettingRepo()
+	seedS3Config(t, repo)
+
+	lastModified := time.Date(2026, 5, 28, 8, 9, 10, 0, time.UTC)
+	store := newMockObjectStore()
+	store.listedObjects = []BackupObjectInfo{
+		{
+			Key:          "backups/2026/05/28/testdb_20260528_080910.sql.gz",
+			SizeBytes:    1234,
+			LastModified: lastModified,
+		},
+	}
+	svc := newTestBackupService(repo, &mockDumper{}, store)
+
+	result, err := svc.DiscoverRemoteBackups(context.Background())
+
+	require.NoError(t, err)
+	require.Equal(t, 1, result.Scanned)
+	require.Equal(t, 1, result.Imported)
+	require.Equal(t, 0, result.Existing)
+	require.Equal(t, 0, result.Skipped)
+	require.Len(t, result.Items, 1)
+	record := result.Items[0]
+	require.Equal(t, "remote-", record.ID[:len("remote-")])
+	require.Equal(t, "completed", record.Status)
+	require.Equal(t, "postgres", record.BackupType)
+	require.Equal(t, "testdb_20260528_080910.sql.gz", record.FileName)
+	require.Equal(t, "backups/2026/05/28/testdb_20260528_080910.sql.gz", record.S3Key)
+	require.Equal(t, int64(1234), record.SizeBytes)
+	require.Equal(t, "discovered", record.TriggeredBy)
+	require.Equal(t, "2026-05-28T08:09:10Z", record.StartedAt)
+	require.Equal(t, lastModified.Format(time.RFC3339), record.FinishedAt)
+	require.Empty(t, record.ExpiresAt)
+}
+
+func TestBackupService_DiscoverRemoteBackups_DeduplicatesByS3Key(t *testing.T) {
+	repo := newMockSettingRepo()
+	seedS3Config(t, repo)
+
+	key := "backups/2026/05/28/testdb_20260528_080910.sql.gz"
+	store := newMockObjectStore()
+	store.listedObjects = []BackupObjectInfo{{Key: key, SizeBytes: 1234, LastModified: time.Date(2026, 5, 28, 8, 9, 10, 0, time.UTC)}}
+	svc := newTestBackupService(repo, &mockDumper{}, store)
+	require.NoError(t, svc.saveRecord(context.Background(), &BackupRecord{
+		ID:          "existing-record",
+		Status:      "completed",
+		BackupType:  "postgres",
+		FileName:    "testdb_20260528_080910.sql.gz",
+		S3Key:       key,
+		SizeBytes:   99,
+		TriggeredBy: "manual",
+		StartedAt:   "2026-05-28T08:09:10Z",
+	}))
+
+	result, err := svc.DiscoverRemoteBackups(context.Background())
+
+	require.NoError(t, err)
+	require.Equal(t, 1, result.Scanned)
+	require.Equal(t, 0, result.Imported)
+	require.Equal(t, 1, result.Existing)
+	records, err := svc.loadRecords(context.Background())
+	require.NoError(t, err)
+	require.Len(t, records, 1)
+	require.Equal(t, "existing-record", records[0].ID)
+	require.Equal(t, int64(99), records[0].SizeBytes)
+}
+
+func TestBackupService_DiscoverRemoteBackups_SkipsNonBackupObjects(t *testing.T) {
+	repo := newMockSettingRepo()
+	seedS3Config(t, repo)
+
+	store := newMockObjectStore()
+	store.listedObjects = []BackupObjectInfo{
+		{Key: "backups/", LastModified: time.Date(2026, 5, 28, 8, 0, 0, 0, time.UTC)},
+		{Key: "backups/readme.txt", LastModified: time.Date(2026, 5, 28, 8, 1, 0, 0, time.UTC)},
+		{Key: "backups/2026/05/28/testdb_20260528_080910.sql.gz", SizeBytes: 1234, LastModified: time.Date(2026, 5, 28, 8, 9, 10, 0, time.UTC)},
+	}
+	svc := newTestBackupService(repo, &mockDumper{}, store)
+
+	result, err := svc.DiscoverRemoteBackups(context.Background())
+
+	require.NoError(t, err)
+	require.Equal(t, 3, result.Scanned)
+	require.Equal(t, 1, result.Imported)
+	require.Equal(t, 2, result.Skipped)
+	require.Len(t, result.Items, 1)
+	require.Equal(t, "testdb_20260528_080910.sql.gz", result.Items[0].FileName)
+}
+
+func TestBackupService_DiscoverRemoteBackups_FallsBackToLastModified(t *testing.T) {
+	repo := newMockSettingRepo()
+	seedS3Config(t, repo)
+
+	lastModified := time.Date(2025, 12, 1, 2, 3, 4, 0, time.UTC)
+	store := newMockObjectStore()
+	store.listedObjects = []BackupObjectInfo{
+		{Key: "backups/manual-upload.sql.gz", SizeBytes: 777, LastModified: lastModified},
+	}
+	svc := newTestBackupService(repo, &mockDumper{}, store)
+
+	result, err := svc.DiscoverRemoteBackups(context.Background())
+
+	require.NoError(t, err)
+	require.Equal(t, 1, result.Imported)
+	require.Equal(t, lastModified.Format(time.RFC3339), result.Items[0].StartedAt)
+	require.Equal(t, lastModified.Format(time.RFC3339), result.Items[0].FinishedAt)
+}
+
+func TestBackupService_DiscoverRemoteBackups_KeepsNewestRecordsWithinLimit(t *testing.T) {
+	repo := newMockSettingRepo()
+	seedS3Config(t, repo)
+
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	store := newMockObjectStore()
+	for i := 0; i < maxBackupRecords+2; i++ {
+		startedAt := base.Add(time.Duration(i) * time.Hour)
+		fileName := fmt.Sprintf("testdb_%s.sql.gz", startedAt.Format("20060102_150405"))
+		store.listedObjects = append(store.listedObjects, BackupObjectInfo{
+			Key:          fmt.Sprintf("backups/%s/%s", startedAt.Format("2006/01/02"), fileName),
+			SizeBytes:    int64(i + 1),
+			LastModified: startedAt,
+		})
+	}
+	svc := newTestBackupService(repo, &mockDumper{}, store)
+
+	result, err := svc.DiscoverRemoteBackups(context.Background())
+
+	require.NoError(t, err)
+	require.Equal(t, maxBackupRecords+2, result.Scanned)
+	require.Equal(t, maxBackupRecords, result.Imported)
+	require.Equal(t, 2, result.Skipped)
+	require.Len(t, result.Items, maxBackupRecords)
+	require.Equal(t, "testdb_20260105_050000.sql.gz", result.Items[0].FileName)
+
+	records, err := svc.loadRecords(context.Background())
+	require.NoError(t, err)
+	require.Len(t, records, maxBackupRecords)
+	require.Equal(t, "testdb_20260105_050000.sql.gz", records[0].FileName)
+
+	require.NoError(t, svc.saveRecord(context.Background(), &BackupRecord{
+		ID:        "manual-new",
+		Status:    "completed",
+		StartedAt: base.Add(200 * time.Hour).Format(time.RFC3339),
+	}))
+	records, err = svc.ListBackups(context.Background())
+	require.NoError(t, err)
+	require.Len(t, records, maxBackupRecords)
+	require.Equal(t, "manual-new", records[0].ID)
+	require.Equal(t, "testdb_20260105_050000.sql.gz", records[1].FileName)
+}
+
+func TestBackupService_DiscoverRemoteBackups_NoS3Config(t *testing.T) {
+	repo := newMockSettingRepo()
+	svc := newTestBackupService(repo, &mockDumper{}, newMockObjectStore())
+
+	_, err := svc.DiscoverRemoteBackups(context.Background())
+
+	require.ErrorIs(t, err, ErrBackupS3NotConfigured)
+}
+
+func TestBackupService_CleanupOldBackups_SkipsDiscovered(t *testing.T) {
+	repo := newMockSettingRepo()
+	seedS3Config(t, repo)
+
+	store := newMockObjectStore()
+	store.objects["backups/manual-old.sql.gz"] = []byte("manual")
+	store.objects["backups/discovered-old.sql.gz"] = []byte("discovered")
+	svc := newTestBackupService(repo, &mockDumper{}, store)
+	oldStartedAt := time.Now().AddDate(0, 0, -30).Format(time.RFC3339)
+	require.NoError(t, svc.saveRecord(context.Background(), &BackupRecord{
+		ID:          "manual-old",
+		Status:      "completed",
+		S3Key:       "backups/manual-old.sql.gz",
+		TriggeredBy: "manual",
+		StartedAt:   oldStartedAt,
+	}))
+	require.NoError(t, svc.saveRecord(context.Background(), &BackupRecord{
+		ID:          "discovered-old",
+		Status:      "completed",
+		S3Key:       "backups/discovered-old.sql.gz",
+		TriggeredBy: "discovered",
+		StartedAt:   oldStartedAt,
+	}))
+
+	err := svc.cleanupOldBackups(context.Background(), &BackupScheduleConfig{RetainDays: 7})
+
+	require.NoError(t, err)
+	_, err = svc.GetBackupRecord(context.Background(), "manual-old")
+	require.ErrorIs(t, err, ErrBackupNotFound)
+	discovered, err := svc.GetBackupRecord(context.Background(), "discovered-old")
+	require.NoError(t, err)
+	require.Equal(t, "discovered", discovered.TriggeredBy)
+	store.mu.Lock()
+	_, manualExists := store.objects["backups/manual-old.sql.gz"]
+	_, discoveredExists := store.objects["backups/discovered-old.sql.gz"]
+	store.mu.Unlock()
+	require.False(t, manualExists)
+	require.True(t, discoveredExists)
+}
+
 func TestBackupService_TestS3Connection(t *testing.T) {
 	repo := newMockSettingRepo()
 	store := newMockObjectStore()
@@ -700,4 +924,45 @@ func TestStartRestore_Async(t *testing.T) {
 	final, err := svc.GetBackupRecord(context.Background(), record.ID)
 	require.NoError(t, err)
 	require.Equal(t, "completed", final.RestoreStatus)
+}
+
+func TestStartRestore_RecoversStaleRecordsAfterDatabaseRestore(t *testing.T) {
+	repo := newMockSettingRepo()
+	seedS3Config(t, repo)
+
+	dumper := &mockDumper{dumpData: []byte("-- PostgreSQL dump\n")}
+	store := newMockObjectStore()
+	svc := newTestBackupService(repo, dumper, store)
+	record, err := svc.CreateBackup(context.Background(), "manual", 14)
+	require.NoError(t, err)
+
+	staleStartedAt := time.Now().Add(-1 * time.Hour).Format(time.RFC3339)
+	staleRecords := []BackupRecord{
+		{ID: "old-running", Status: "running", StartedAt: staleStartedAt},
+		{ID: "old-restoring", Status: "completed", RestoreStatus: "running", StartedAt: staleStartedAt},
+	}
+	staleData, err := json.Marshal(staleRecords)
+	require.NoError(t, err)
+	dumper.restoreHook = func() error {
+		return repo.Set(context.Background(), settingKeyBackupRecords, string(staleData))
+	}
+
+	restored, err := svc.StartRestore(context.Background(), record.ID)
+	require.NoError(t, err)
+	require.Equal(t, "running", restored.RestoreStatus)
+	svc.wg.Wait()
+
+	final, err := svc.GetBackupRecord(context.Background(), record.ID)
+	require.NoError(t, err)
+	require.Equal(t, "completed", final.RestoreStatus)
+
+	oldRunning, err := svc.GetBackupRecord(context.Background(), "old-running")
+	require.NoError(t, err)
+	require.Equal(t, "failed", oldRunning.Status)
+	require.Contains(t, oldRunning.ErrorMsg, "database restore")
+
+	oldRestoring, err := svc.GetBackupRecord(context.Background(), "old-restoring")
+	require.NoError(t, err)
+	require.Equal(t, "failed", oldRestoring.RestoreStatus)
+	require.Contains(t, oldRestoring.RestoreError, "database restore")
 }

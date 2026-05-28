@@ -3,10 +3,14 @@ package service
 import (
 	"compress/gzip"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"path"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -36,6 +40,8 @@ var (
 	ErrRestoreInProgress     = infraerrors.Conflict("RESTORE_IN_PROGRESS", "a restore is already in progress")
 	ErrBackupRecordsCorrupt  = infraerrors.InternalServer("BACKUP_RECORDS_CORRUPT", "backup records data is corrupted")
 	ErrBackupS3ConfigCorrupt = infraerrors.InternalServer("BACKUP_S3_CONFIG_CORRUPT", "backup S3 config data is corrupted")
+
+	backupFileTimestampPattern = regexp.MustCompile(`_(\d{8}_\d{6})\.sql\.gz$`)
 )
 
 // ─── 接口定义 ───
@@ -53,6 +59,7 @@ type BackupObjectStore interface {
 	Delete(ctx context.Context, key string) error
 	PresignURL(ctx context.Context, key string, expiry time.Duration) (string, error)
 	HeadBucket(ctx context.Context) error
+	List(ctx context.Context, prefix string) ([]BackupObjectInfo, error)
 }
 
 // BackupObjectStoreFactory creates an object store from S3 config
@@ -84,6 +91,22 @@ type BackupScheduleConfig struct {
 	RetainCount int    `json:"retain_count"` // 最多保留份数，0=不限制
 }
 
+// BackupObjectInfo 远端备份对象元数据
+type BackupObjectInfo struct {
+	Key          string
+	SizeBytes    int64
+	LastModified time.Time
+}
+
+// BackupDiscoveryResult 历史备份发现结果
+type BackupDiscoveryResult struct {
+	Items    []BackupRecord `json:"items"`
+	Scanned  int            `json:"scanned"`
+	Imported int            `json:"imported"`
+	Existing int            `json:"existing"`
+	Skipped  int            `json:"skipped"`
+}
+
 // BackupRecord 备份记录
 type BackupRecord struct {
 	ID            string `json:"id"`
@@ -92,7 +115,7 @@ type BackupRecord struct {
 	FileName      string `json:"file_name"`
 	S3Key         string `json:"s3_key"`
 	SizeBytes     int64  `json:"size_bytes"`
-	TriggeredBy   string `json:"triggered_by"` // manual, scheduled
+	TriggeredBy   string `json:"triggered_by"` // manual, scheduled, discovered
 	ErrorMsg      string `json:"error_message,omitempty"`
 	StartedAt     string `json:"started_at"`
 	FinishedAt    string `json:"finished_at,omitempty"`
@@ -175,6 +198,10 @@ func (s *BackupService) Start() {
 
 // recoverStaleRecords 启动时将孤立的 running 记录标记为 failed
 func (s *BackupService) recoverStaleRecords() {
+	s.recoverStaleRecordsWithReason("server restart")
+}
+
+func (s *BackupService) recoverStaleRecordsWithReason(reason string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
@@ -185,7 +212,7 @@ func (s *BackupService) recoverStaleRecords() {
 	for i := range records {
 		if records[i].Status == "running" {
 			records[i].Status = "failed"
-			records[i].ErrorMsg = "interrupted by server restart"
+			records[i].ErrorMsg = fmt.Sprintf("interrupted by %s", reason)
 			records[i].Progress = ""
 			records[i].FinishedAt = time.Now().Format(time.RFC3339)
 			_ = s.saveRecord(ctx, &records[i])
@@ -193,7 +220,7 @@ func (s *BackupService) recoverStaleRecords() {
 		}
 		if records[i].RestoreStatus == "running" {
 			records[i].RestoreStatus = "failed"
-			records[i].RestoreError = "interrupted by server restart"
+			records[i].RestoreError = fmt.Sprintf("interrupted by %s", reason)
 			_ = s.saveRecord(ctx, &records[i])
 			logger.LegacyPrintf("service.backup", "[Backup] recovered stale restoring record: %s", records[i].ID)
 		}
@@ -757,6 +784,7 @@ func (s *BackupService) RestoreBackup(ctx context.Context, backupID string) erro
 	if err := s.dumper.Restore(ctx, gzReader); err != nil {
 		return fmt.Errorf("pg restore: %w", err)
 	}
+	s.recoverStaleRecordsWithReason("database restore")
 
 	return nil
 }
@@ -861,10 +889,12 @@ func (s *BackupService) executeRestore(record *BackupRecord, objectStore BackupO
 	}
 
 	record.RestoreStatus = "completed"
+	record.RestoreError = ""
 	record.RestoredAt = time.Now().Format(time.RFC3339)
 	if err := s.saveRecord(context.Background(), record); err != nil {
 		logger.LegacyPrintf("service.backup", "[Backup] 保存恢复记录失败: %v", err)
 	}
+	s.recoverStaleRecordsWithReason("database restore")
 }
 
 // ─── 备份记录管理 ───
@@ -874,11 +904,77 @@ func (s *BackupService) ListBackups(ctx context.Context) ([]BackupRecord, error)
 	if err != nil {
 		return nil, err
 	}
-	// 倒序返回（最新在前）
-	sort.Slice(records, func(i, j int) bool {
-		return records[i].StartedAt > records[j].StartedAt
-	})
+	s.sortBackupRecords(records)
 	return records, nil
+}
+
+func (s *BackupService) DiscoverRemoteBackups(ctx context.Context) (*BackupDiscoveryResult, error) {
+	s3Cfg, err := s.loadS3Config(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if s3Cfg == nil || !s3Cfg.IsConfigured() {
+		return nil, ErrBackupS3NotConfigured
+	}
+
+	objectStore, err := s.getOrCreateStore(ctx, s3Cfg)
+	if err != nil {
+		return nil, fmt.Errorf("init object store: %w", err)
+	}
+
+	objects, err := objectStore.List(ctx, s.normalizedBackupListPrefix(s3Cfg))
+	if err != nil {
+		return nil, fmt.Errorf("list backup objects: %w", err)
+	}
+
+	result := &BackupDiscoveryResult{Scanned: len(objects)}
+
+	s.recordsMu.Lock()
+	defer s.recordsMu.Unlock()
+
+	records, err := s.loadRecordsLocked(ctx)
+	if err != nil {
+		return nil, err
+	}
+	existingKeys := make(map[string]struct{}, len(records))
+	for _, record := range records {
+		if record.S3Key != "" {
+			existingKeys[record.S3Key] = struct{}{}
+		}
+	}
+
+	importedKeys := make(map[string]struct{})
+	for _, object := range objects {
+		if !s.isDiscoverableBackupObject(object) {
+			result.Skipped++
+			continue
+		}
+		if _, ok := existingKeys[object.Key]; ok {
+			result.Existing++
+			continue
+		}
+		records = append(records, s.newDiscoveredBackupRecord(object))
+		existingKeys[object.Key] = struct{}{}
+		importedKeys[object.Key] = struct{}{}
+	}
+
+	untrimmedCount := len(records)
+	records = s.normalizeBackupRecords(records)
+	if len(importedKeys) > 0 {
+		for _, record := range records {
+			if _, ok := importedKeys[record.S3Key]; ok {
+				result.Imported++
+			}
+		}
+		result.Skipped += len(importedKeys) - result.Imported
+	}
+	if len(importedKeys) > 0 || len(records) != untrimmedCount {
+		if err := s.saveRecordsLocked(ctx, records); err != nil {
+			return nil, err
+		}
+	}
+	result.Items = records
+	return result, nil
 }
 
 func (s *BackupService) GetBackupRecord(ctx context.Context, backupID string) (*BackupRecord, error) {
@@ -1009,6 +1105,71 @@ func (s *BackupService) buildS3Key(cfg *BackupS3Config, fileName string) string 
 	return fmt.Sprintf("%s/%s/%s", prefix, time.Now().Format("2006/01/02"), fileName)
 }
 
+func (s *BackupService) normalizedBackupListPrefix(cfg *BackupS3Config) string {
+	prefix := strings.TrimRight(cfg.Prefix, "/")
+	if prefix == "" {
+		prefix = "backups"
+	}
+	return prefix + "/"
+}
+
+func (s *BackupService) isDiscoverableBackupObject(object BackupObjectInfo) bool {
+	return object.Key != "" && !strings.HasSuffix(object.Key, "/") && strings.HasSuffix(object.Key, ".sql.gz")
+}
+
+func (s *BackupService) newDiscoveredBackupRecord(object BackupObjectInfo) BackupRecord {
+	startedAt := s.inferBackupStartedAt(object)
+	finishedAt := startedAt
+	if !object.LastModified.IsZero() {
+		finishedAt = object.LastModified.UTC()
+	}
+	return BackupRecord{
+		ID:          s.deterministicRemoteBackupID(object.Key),
+		Status:      "completed",
+		BackupType:  "postgres",
+		FileName:    path.Base(object.Key),
+		S3Key:       object.Key,
+		SizeBytes:   object.SizeBytes,
+		TriggeredBy: "discovered",
+		StartedAt:   startedAt.Format(time.RFC3339),
+		FinishedAt:  finishedAt.Format(time.RFC3339),
+	}
+}
+
+func (s *BackupService) inferBackupStartedAt(object BackupObjectInfo) time.Time {
+	fileName := path.Base(object.Key)
+	matches := backupFileTimestampPattern.FindStringSubmatch(fileName)
+	if len(matches) == 2 {
+		if parsed, err := time.ParseInLocation("20060102_150405", matches[1], time.UTC); err == nil {
+			return parsed.UTC()
+		}
+	}
+	if !object.LastModified.IsZero() {
+		return object.LastModified.UTC()
+	}
+	return time.Now().UTC()
+}
+
+func (s *BackupService) deterministicRemoteBackupID(key string) string {
+	sum := sha256.Sum256([]byte(key))
+	return "remote-" + hex.EncodeToString(sum[:])[:12]
+}
+
+func (s *BackupService) sortBackupRecords(records []BackupRecord) {
+	// 倒序返回（最新在前）
+	sort.Slice(records, func(i, j int) bool {
+		return records[i].StartedAt > records[j].StartedAt
+	})
+}
+
+func (s *BackupService) normalizeBackupRecords(records []BackupRecord) []BackupRecord {
+	s.sortBackupRecords(records)
+	if len(records) > maxBackupRecords {
+		return records[:maxBackupRecords]
+	}
+	return records
+}
+
 // loadRecords 加载备份记录，区分"无数据"和"数据损坏"
 func (s *BackupService) loadRecords(ctx context.Context) ([]BackupRecord, error) {
 	s.recordsMu.Lock()
@@ -1058,10 +1219,7 @@ func (s *BackupService) saveRecord(ctx context.Context, record *BackupRecord) er
 		records = append(records, *record)
 	}
 
-	// 限制记录数量
-	if len(records) > maxBackupRecords {
-		records = records[len(records)-maxBackupRecords:]
-	}
+	records = s.normalizeBackupRecords(records)
 
 	return s.saveRecordsLocked(ctx, records)
 }
@@ -1087,11 +1245,17 @@ func (s *BackupService) cleanupOldBackups(ctx context.Context, schedule *BackupS
 	var toDelete []BackupRecord
 	var toKeep []BackupRecord
 
-	for i, r := range records {
+	managedIndex := 0
+	for _, r := range records {
+		if r.TriggeredBy == "discovered" {
+			toKeep = append(toKeep, r)
+			continue
+		}
+
 		shouldDelete := false
 
 		// 按保留份数清理
-		if schedule.RetainCount > 0 && i >= schedule.RetainCount {
+		if schedule.RetainCount > 0 && managedIndex >= schedule.RetainCount {
 			shouldDelete = true
 		}
 
@@ -1108,6 +1272,7 @@ func (s *BackupService) cleanupOldBackups(ctx context.Context, schedule *BackupS
 		} else {
 			toKeep = append(toKeep, r)
 		}
+		managedIndex++
 	}
 
 	// 删除 S3 上的文件
