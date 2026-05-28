@@ -487,6 +487,7 @@ func registerBackupRoutes(admin *gin.RouterGroup, h *handler.Handlers) {
 		// 备份操作
 		backup.POST("", h.Admin.Backup.CreateBackup)
 		backup.GET("", h.Admin.Backup.ListBackups)
+		backup.POST("/discover", h.Admin.Backup.DiscoverBackups)
 		backup.GET("/:id", h.Admin.Backup.GetBackup)
 		backup.DELETE("/:id", h.Admin.Backup.DeleteBackup)
 		backup.GET("/:id/download-url", h.Admin.Backup.GetDownloadURL)

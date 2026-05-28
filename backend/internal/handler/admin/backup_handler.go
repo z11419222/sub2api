@@ -118,6 +118,15 @@ func (h *BackupHandler) ListBackups(c *gin.Context) {
 	response.Success(c, gin.H{"items": records})
 }
 
+func (h *BackupHandler) DiscoverBackups(c *gin.Context) {
+	result, err := h.backupService.DiscoverRemoteBackups(c.Request.Context())
+	if err != nil {
+		response.ErrorFrom(c, err)
+		return
+	}
+	response.Success(c, result)
+}
+
 func (h *BackupHandler) GetBackup(c *gin.Context) {
 	backupID := c.Param("id")
 	if backupID == "" {
