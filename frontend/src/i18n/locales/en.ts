@@ -1452,6 +1452,9 @@ export default {
         description: 'Create manual backups and manage existing backup records',
         createBackup: 'Create Backup',
         backing: 'Backing up...',
+        discoverBackups: 'Discover History',
+        discovering: 'Discovering...',
+        discoverDone: 'Scanned {scanned} remote objects and imported {imported} historical backups',
         backupCreated: 'Backup created successfully',
         expireDays: 'Expire Days',
         alreadyInProgress: 'A backup is already in progress',
@@ -1482,7 +1485,8 @@ export default {
       },
       trigger: {
         manual: 'Manual',
-        scheduled: 'Scheduled'
+        scheduled: 'Scheduled',
+        discovered: 'Discovered'
       },
       neverExpire: 'Never',
       empty: 'No backup records',

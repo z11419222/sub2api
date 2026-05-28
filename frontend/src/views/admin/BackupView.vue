@@ -114,6 +114,9 @@
             <button type="button" class="btn btn-secondary btn-sm" :disabled="loadingBackups" @click="loadBackups">
               {{ loadingBackups ? t('common.loading') : t('common.refresh') }}
             </button>
+            <button type="button" class="btn btn-secondary btn-sm" :disabled="discoveringBackups" @click="discoverBackups">
+              {{ discoveringBackups ? t('admin.backup.operations.discovering') : t('admin.backup.operations.discoverBackups') }}
+            </button>
           </div>
         </div>
 
@@ -150,7 +153,7 @@
                   {{ record.expires_at ? formatDate(record.expires_at) : t('admin.backup.neverExpire') }}
                 </td>
                 <td class="py-3 pr-4 text-xs">
-                  {{ record.triggered_by === 'scheduled' ? t('admin.backup.trigger.scheduled') : t('admin.backup.trigger.manual') }}
+                  {{ triggerLabel(record.triggered_by) }}
                 </td>
                 <td class="py-3 pr-4 text-xs">{{ formatDate(record.started_at) }}</td>
                 <td class="py-3 text-xs">
@@ -315,6 +318,7 @@ const savingSchedule = ref(false)
 const backups = ref<BackupRecord[]>([])
 const loadingBackups = ref(false)
 const creatingBackup = ref(false)
+const discoveringBackups = ref(false)
 const restoringId = ref('')
 const manualExpireDays = ref(14)
 
@@ -537,6 +541,19 @@ async function createBackup() {
   }
 }
 
+async function discoverBackups() {
+  discoveringBackups.value = true
+  try {
+    const result = await adminAPI.backup.discoverBackups()
+    backups.value = result.items || []
+    appStore.showSuccess(t('admin.backup.operations.discoverDone', { scanned: result.scanned, imported: result.imported }))
+  } catch (error) {
+    appStore.showError((error as { message?: string })?.message || t('errors.networkError'))
+  } finally {
+    discoveringBackups.value = false
+  }
+}
+
 async function downloadBackup(id: string) {
   try {
     const result = await adminAPI.backup.getDownloadURL(id)
@@ -601,6 +618,12 @@ function formatDate(value?: string): string {
   const date = new Date(value)
   if (Number.isNaN(date.getTime())) return value
   return date.toLocaleString()
+}
+
+function triggerLabel(triggeredBy: string): string {
+  if (triggeredBy === 'scheduled') return t('admin.backup.trigger.scheduled')
+  if (triggeredBy === 'discovered') return t('admin.backup.trigger.discovered')
+  return t('admin.backup.trigger.manual')
 }
 
 onMounted(async () => {

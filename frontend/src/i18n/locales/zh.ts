@@ -1473,6 +1473,9 @@ export default {
         description: '创建手动备份和管理已有备份记录',
         createBackup: '创建备份',
         backing: '备份中...',
+        discoverBackups: '发现历史备份',
+        discovering: '发现中...',
+        discoverDone: '已扫描 {scanned} 个远端对象，导入 {imported} 个历史备份',
         backupCreated: '备份创建成功',
         expireDays: '过期天数',
         alreadyInProgress: '已有备份正在进行中',
@@ -1503,7 +1506,8 @@ export default {
       },
       trigger: {
         manual: '手动',
-        scheduled: '定时'
+        scheduled: '定时',
+        discovered: '已发现'
       },
       neverExpire: '永不过期',
       empty: '暂无备份记录',

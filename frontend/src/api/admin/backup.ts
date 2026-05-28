@@ -44,6 +44,14 @@ export interface TestS3Response {
   message: string
 }
 
+export interface BackupDiscoveryResult {
+  items: BackupRecord[]
+  scanned: number
+  imported: number
+  existing: number
+  skipped: number
+}
+
 // S3 Config
 export async function getS3Config(): Promise<BackupS3Config> {
   const { data } = await apiClient.get<BackupS3Config>('/admin/backups/s3-config')
@@ -82,6 +90,11 @@ export async function listBackups(): Promise<{ items: BackupRecord[] }> {
   return data
 }
 
+export async function discoverBackups(): Promise<BackupDiscoveryResult> {
+  const { data } = await apiClient.post<BackupDiscoveryResult>('/admin/backups/discover')
+  return data
+}
+
 export async function getBackup(id: string): Promise<BackupRecord> {
   const { data } = await apiClient.get<BackupRecord>(`/admin/backups/${id}`)
   return data
@@ -110,6 +123,7 @@ export const backupAPI = {
   updateSchedule,
   createBackup,
   listBackups,
+  discoverBackups,
   getBackup,
   deleteBackup,
   getDownloadURL,
