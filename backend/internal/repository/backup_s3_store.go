@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -114,4 +115,36 @@ func (s *S3BackupStore) HeadBucket(ctx context.Context) error {
 		return fmt.Errorf("S3 HeadBucket failed: %w", err)
 	}
 	return nil
+}
+
+func (s *S3BackupStore) List(ctx context.Context, prefix string) ([]service.BackupObjectInfo, error) {
+	paginator := s3.NewListObjectsV2Paginator(s.client, &s3.ListObjectsV2Input{
+		Bucket: &s.bucket,
+		Prefix: &prefix,
+	})
+
+	var objects []service.BackupObjectInfo
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("S3 ListObjectsV2: %w", err)
+		}
+
+		for _, object := range page.Contents {
+			key := aws.ToString(object.Key)
+			if key == "" || strings.HasSuffix(key, "/") || !strings.HasSuffix(key, ".sql.gz") {
+				continue
+			}
+			var lastModified time.Time
+			if object.LastModified != nil {
+				lastModified = object.LastModified.UTC()
+			}
+			objects = append(objects, service.BackupObjectInfo{
+				Key:          key,
+				SizeBytes:    aws.ToInt64(object.Size),
+				LastModified: lastModified,
+			})
+		}
+	}
+	return objects, nil
 }
