@@ -147,6 +147,16 @@ export async function update(id: number, updates: UpdateAccountRequest): Promise
 }
 
 /**
+ * Copy an API key account server-side without exposing raw credentials.
+ * @param id - Source account ID
+ * @returns Copied account
+ */
+export async function copyAccount(id: number): Promise<Account> {
+  const { data } = await apiClient.post<Account>(`/admin/accounts/${id}/copy`)
+  return data
+}
+
+/**
  * Check mixed-channel risk for account-group binding.
  */
 export async function checkMixedChannelRisk(
@@ -711,6 +721,7 @@ export const accountsAPI = {
   getById,
   create,
   update,
+  copyAccount,
   checkMixedChannelRisk,
   delete: deleteAccount,
   toggleStatus,
