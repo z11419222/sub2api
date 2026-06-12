@@ -80,6 +80,7 @@ type AdminService interface {
 	GetAccount(ctx context.Context, id int64) (*Account, error)
 	GetAccountsByIDs(ctx context.Context, ids []int64) ([]*Account, error)
 	CreateAccount(ctx context.Context, input *CreateAccountInput) (*Account, error)
+	CopyAccount(ctx context.Context, id int64) (*Account, error)
 	UpdateAccount(ctx context.Context, id int64, input *UpdateAccountInput) (*Account, error)
 	// UpdateAccountExtra 仅对 Extra 做 JSONB 增量合并（key 级覆盖），不会影响其它字段或运行态键。
 	// 用于刷新流程持久化 account_uuid / org_uuid 等少量键，避免被全量快照覆盖。
@@ -2672,6 +2673,156 @@ func (s *adminServiceImpl) CreateAccount(ctx context.Context, input *CreateAccou
 	}
 
 	return account, nil
+}
+
+func (s *adminServiceImpl) CopyAccount(ctx context.Context, id int64) (*Account, error) {
+	source, err := s.accountRepo.GetByID(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if source.Type != AccountTypeAPIKey {
+		return nil, infraerrors.BadRequest("ACCOUNT_COPY_UNSUPPORTED_TYPE", "only apikey accounts can be copied")
+	}
+
+	groupIDs := append([]int64(nil), source.GroupIDs...)
+	var expiresAt *int64
+	if source.ExpiresAt != nil {
+		unix := source.ExpiresAt.Unix()
+		expiresAt = &unix
+	}
+	autoPauseOnExpired := source.AutoPauseOnExpired
+
+	return s.CreateAccount(ctx, &CreateAccountInput{
+		Name:                  s.nextAccountCopyName(ctx, source),
+		Notes:                 copyStringPtr(source.Notes),
+		Platform:              source.Platform,
+		Type:                  source.Type,
+		Credentials:           cloneAccountMap(source.Credentials),
+		Extra:                 cloneCopyableAccountExtra(source.Extra),
+		ProxyID:               copyInt64Ptr(source.ProxyID),
+		Concurrency:           source.Concurrency,
+		Priority:              source.Priority,
+		RateMultiplier:        copyFloat64Ptr(source.RateMultiplier),
+		LoadFactor:            copyIntPtr(source.LoadFactor),
+		GroupIDs:              groupIDs,
+		ExpiresAt:             expiresAt,
+		AutoPauseOnExpired:    &autoPauseOnExpired,
+		SkipDefaultGroupBind:  true,
+		SkipMixedChannelCheck: true,
+	})
+}
+
+func (s *adminServiceImpl) nextAccountCopyName(ctx context.Context, source *Account) string {
+	base := source.Name
+	firstCopy := base + " (copy)"
+	existing := map[string]struct{}{base: {}}
+	accounts, _, err := s.ListAccounts(ctx, 1, 1000, source.Platform, source.Type, "", base, 0, "", "name", "asc")
+	if err == nil {
+		for _, account := range accounts {
+			existing[account.Name] = struct{}{}
+		}
+	}
+	if _, ok := existing[firstCopy]; !ok {
+		return firstCopy
+	}
+	for index := 2; ; index++ {
+		candidate := fmt.Sprintf("%s (copy %d)", base, index)
+		if _, ok := existing[candidate]; !ok {
+			return candidate
+		}
+	}
+}
+
+func cloneCopyableAccountExtra(extra map[string]any) map[string]any {
+	cloned := cloneAccountMap(extra)
+	for _, key := range []string{
+		"quota_used",
+		"quota_daily_used",
+		"quota_daily_start",
+		"quota_weekly_used",
+		"quota_weekly_start",
+		"quota_reset_at",
+		"quota_daily_reset_at",
+		"quota_weekly_reset_at",
+		"codex_usage_updated_at",
+		modelRateLimitsKey,
+		"session_window_utilization",
+	} {
+		delete(cloned, key)
+	}
+	for key := range cloned {
+		for _, prefix := range []string{
+			"codex_primary_",
+			"codex_secondary_",
+			"codex_5h_",
+			"codex_7d_",
+			"passive_usage_",
+		} {
+			if strings.HasPrefix(key, prefix) {
+				delete(cloned, key)
+				break
+			}
+		}
+	}
+	return cloned
+}
+
+func cloneAccountMap(values map[string]any) map[string]any {
+	if values == nil {
+		return nil
+	}
+	cloned := make(map[string]any, len(values))
+	for key, value := range values {
+		cloned[key] = cloneAccountValue(value)
+	}
+	return cloned
+}
+
+func cloneAccountValue(value any) any {
+	switch typed := value.(type) {
+	case map[string]any:
+		return cloneAccountMap(typed)
+	case []any:
+		cloned := make([]any, len(typed))
+		for i, item := range typed {
+			cloned[i] = cloneAccountValue(item)
+		}
+		return cloned
+	default:
+		return value
+	}
+}
+
+func copyStringPtr(v *string) *string {
+	if v == nil {
+		return nil
+	}
+	copied := *v
+	return &copied
+}
+
+func copyInt64Ptr(v *int64) *int64 {
+	if v == nil {
+		return nil
+	}
+	copied := *v
+	return &copied
+}
+
+func copyFloat64Ptr(v *float64) *float64 {
+	if v == nil {
+		return nil
+	}
+	copied := *v
+	return &copied
+}
+
+func copyIntPtr(v *int) *int {
+	if v == nil {
+		return nil
+	}
+	copied := *v
+	return &copied
 }
 
 func (s *adminServiceImpl) UpdateAccount(ctx context.Context, id int64, input *UpdateAccountInput) (*Account, error) {

@@ -20,12 +20,15 @@ type stubAdminService struct {
 	boundAuthIdentity    *service.AdminBindAuthIdentityInput
 	boundAuthIdentityFor int64
 	createdAccounts      []*service.CreateAccountInput
+	copiedAccount        *service.Account
+	copiedAccountID      int64
 	createdProxies       []*service.CreateProxyInput
 	updatedProxyIDs      []int64
 	updatedProxies       []*service.UpdateProxyInput
 	testedProxyIDs       []int64
 	getUserErr           error
 	createAccountErr     error
+	copyAccountErr       error
 	updateAccountErr     error
 	bulkUpdateAccountErr error
 	checkMixedErr        error
@@ -353,6 +356,25 @@ func (s *stubAdminService) CreateAccount(ctx context.Context, input *service.Cre
 		return nil, s.createAccountErr
 	}
 	account := service.Account{ID: 300, Name: input.Name, Status: service.StatusActive}
+	return &account, nil
+}
+
+func (s *stubAdminService) CopyAccount(ctx context.Context, id int64) (*service.Account, error) {
+	s.copiedAccountID = id
+	if s.copyAccountErr != nil {
+		return nil, s.copyAccountErr
+	}
+	if s.copiedAccount != nil {
+		return s.copiedAccount, nil
+	}
+	account := service.Account{
+		ID:          301,
+		Name:        "account (copy)",
+		Platform:    service.PlatformOpenAI,
+		Type:        service.AccountTypeAPIKey,
+		Credentials: map[string]any{"api_key": "sk-test"},
+		Status:      service.StatusActive,
+	}
 	return &account, nil
 }
 
