@@ -32,6 +32,63 @@ func (w *openAIChatFailingWriter) Write(p []byte) (int, error) {
 	return w.ResponseWriter.Write(p)
 }
 
+type openAIChatStreamReadErrorCloser struct {
+	payload []byte
+	err     error
+	sent    bool
+}
+
+func (r *openAIChatStreamReadErrorCloser) Read(p []byte) (int, error) {
+	if !r.sent {
+		r.sent = true
+		return copy(p, r.payload), nil
+	}
+	return 0, r.err
+}
+
+func (r *openAIChatStreamReadErrorCloser) Close() error { return nil }
+
+func TestHandleChatStreamingResponse_ClassifiesHTTP2ReadError(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header: http.Header{
+			"Content-Type": []string{"text/event-stream"},
+			"x-request-id": []string{"upstream-rid"},
+		},
+		Body: &openAIChatStreamReadErrorCloser{
+			payload: []byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n"),
+			err:     errors.New("stream error: stream ID 5; INTERNAL_ERROR; received from peer"),
+		},
+	}
+	svc := &OpenAIGatewayService{cfg: &config.Config{}}
+
+	result, err := svc.handleChatStreamingResponse(
+		resp,
+		c,
+		&Account{ID: 1, Name: "openai-oauth", Platform: PlatformOpenAI},
+		"gpt-5.6-sol",
+		"gpt-5.6-sol",
+		"gpt-5.6-sol",
+		time.Now(),
+		0,
+	)
+
+	require.Error(t, err)
+	require.NotNil(t, result)
+	require.True(t, c.Writer.Written(), "partial output must make replay unsafe")
+	code, message, ok := OpenAIUpstreamStreamReadErrorDetails(err)
+	require.True(t, ok)
+	require.Equal(t, OpenAIUpstreamHTTP2StreamErrorCode, code)
+	require.Equal(t, "Upstream HTTP/2 stream failed", message)
+	require.NotContains(t, message, "stream ID")
+	require.NotContains(t, message, "INTERNAL_ERROR")
+}
+
 func TestNormalizeResponsesRequestServiceTier(t *testing.T) {
 	t.Parallel()
 
@@ -98,7 +155,7 @@ func TestNormalizeResponsesBodyServiceTier(t *testing.T) {
 	require.False(t, gjson.GetBytes(body, "service_tier").Exists())
 }
 
-func TestForwardAsChatCompletions_UnknownModelDoesNotUseDefaultMappedModel(t *testing.T) {
+func TestForwardAsChatCompletions_UnknownModelWithoutMessagesDispatchKeepsRequestedModel(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	rec := httptest.NewRecorder()
@@ -129,7 +186,7 @@ func TestForwardAsChatCompletions_UnknownModelDoesNotUseDefaultMappedModel(t *te
 		},
 	}
 
-	result, err := svc.ForwardAsChatCompletions(context.Background(), c, account, body, "", "gpt-5.4")
+	result, err := svc.ForwardAsChatCompletions(context.Background(), c, account, body, "", "")
 	require.Error(t, err)
 	require.Nil(t, result)
 	require.Equal(t, "gpt6", gjson.GetBytes(upstream.lastBody, "model").String())
@@ -269,7 +326,7 @@ func TestForwardAsChatCompletions_ClientDisconnectDrainsUpstreamUsage(t *testing
 	require.Equal(t, 4, result.Usage.CacheReadInputTokens)
 }
 
-func TestForwardAsChatCompletions_BufferedResponseFailedTriggersFailover(t *testing.T) {
+func TestForwardAsChatCompletions_BufferedContextWindowResponseFailedReturnsErrorWithoutFailover(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	rec := httptest.NewRecorder()
@@ -306,13 +363,13 @@ func TestForwardAsChatCompletions_BufferedResponseFailedTriggersFailover(t *test
 	require.Error(t, err)
 	require.Nil(t, result)
 	var failoverErr *UpstreamFailoverError
-	require.ErrorAs(t, err, &failoverErr)
-	require.Equal(t, http.StatusBadGateway, failoverErr.StatusCode)
-	require.Contains(t, string(failoverErr.ResponseBody), "input exceeds the context window")
-	require.False(t, c.Writer.Written())
+	require.False(t, errors.As(err, &failoverErr))
+	require.True(t, c.Writer.Written())
+	require.Equal(t, http.StatusBadGateway, rec.Code)
+	require.Contains(t, rec.Body.String(), "input exceeds the context window")
 }
 
-func TestForwardAsChatCompletions_StreamResponseFailedTriggersFailoverBeforeFlush(t *testing.T) {
+func TestForwardAsChatCompletions_StreamContextWindowResponseFailedReturnsErrorWithoutFailover(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	rec := httptest.NewRecorder()
@@ -349,12 +406,14 @@ func TestForwardAsChatCompletions_StreamResponseFailedTriggersFailoverBeforeFlus
 
 	result, err := svc.ForwardAsChatCompletions(context.Background(), c, account, body, "", "gpt-5.5")
 	require.Error(t, err)
-	require.Nil(t, result)
+	require.NotNil(t, result)
 	var failoverErr *UpstreamFailoverError
-	require.ErrorAs(t, err, &failoverErr)
-	require.Equal(t, http.StatusBadGateway, failoverErr.StatusCode)
-	require.Contains(t, string(failoverErr.ResponseBody), "input exceeds the context window")
-	require.False(t, c.Writer.Written())
+	require.False(t, errors.As(err, &failoverErr))
+	require.True(t, c.Writer.Written())
+	require.Equal(t, http.StatusBadGateway, rec.Code)
+	require.Contains(t, rec.Header().Get("Content-Type"), "application/json")
+	require.Contains(t, rec.Body.String(), "input exceeds the context window")
+	require.NotContains(t, rec.Body.String(), "[DONE]")
 }
 
 func TestForwardAsChatCompletions_StreamCyberPolicyNoFailover(t *testing.T) {
